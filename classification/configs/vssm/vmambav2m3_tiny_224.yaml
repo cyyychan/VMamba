@@ -1,0 +1,23 @@
+# SS2Dm3: upstream Mamba3 on H*W. CUDA + mamba_ssm Mamba-3 (M3_MIMO false → SISO Triton).
+# 参数量：m0 tiny 在 SSM_D_STATE=1 时极省；Mamba3 的 in_proj 随 d_inner、d_state 膨胀，故这里用 SSM_RATIO=1.0、较小 d_state 压参（与 m0 同 depth/embed，SSM 通道窄一半）。
+MODEL:
+  TYPE: vssm
+  NAME: vssm1_tiny_m3_0230
+  DROP_PATH_RATE: 0.2
+  VSSM:
+    EMBED_DIM: 96
+    DEPTHS: [ 2, 2, 5, 2 ]
+    SSM_D_STATE: 8
+    SSM_DT_RANK: "auto"
+    SSM_RATIO: 1.0
+    SSM_CONV: 3
+    SSM_CONV_BIAS: false
+    SSM_INIT: "v2"
+    SSM_FORWARDTYPE: "m3_noz"
+    MLP_RATIO: 4.0
+    DOWNSAMPLE: "v3"
+    PATCHEMBED: "v2"
+    NORM_LAYER: "ln2d"
+    M3_EXPAND: 1
+    M3_HEADDIM: 16
+    M3_MIMO: false

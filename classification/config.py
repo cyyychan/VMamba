@@ -95,6 +95,14 @@ _C.MODEL.VSSM.DOWNSAMPLE = "v2"
 _C.MODEL.VSSM.PATCHEMBED = "v2"
 _C.MODEL.VSSM.POSEMBED = False
 _C.MODEL.VSSM.GMLP = False
+# Mamba-3 (SS2Dm3 only; see vmamba.SS2Dm3)
+_C.MODEL.VSSM.M3_EXPAND = 2
+_C.MODEL.VSSM.M3_HEADDIM = 64
+_C.MODEL.VSSM.M3_MIMO = True
+_C.MODEL.VSSM.M3_MIMO_RANK = 4
+_C.MODEL.VSSM.M3_CHUNK_SIZE = -1
+_C.MODEL.VSSM.M3_ROPE_FRACTION = 0.5
+_C.MODEL.VSSM.M3_A_FLOOR = 1e-4
 
 # -----------------------------------------------------------------------------
 # Training settings

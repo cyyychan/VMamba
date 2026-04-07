@@ -35,6 +35,11 @@ try:
 except:
     from mamba2.ssd_minimal import selective_scan_chunk_fn
 
+try:
+    from mamba_ssm.modules.mamba3 import Mamba3 as Mamba3Module
+except ImportError:
+    Mamba3Module = None
+
 
 # =====================================================
 # we have this class as linear and conv init differ from each other
@@ -1067,7 +1072,7 @@ class SS2Dm0:
             xs, dts, Bs, Cs = to_fp32(xs, dts, Bs, Cs)
 
         ys, final_state = selective_scan_chunk_fn(
-            xs, dts, As, Bs, Cs, chunk_size=chunk_size, D=Ds, dt_bias=dt_bias, 
+            xs, dts, As, Bs, Cs, chunk_size=chunk_size, D=Ds, dt_bias=dt_bias,
             initial_states=initial_state, dt_softplus=True, return_final_states=True,
             backend=selective_scan_backend,
         )
@@ -1076,7 +1081,7 @@ class SS2Dm0:
         if getattr(self, "__DEBUG__", False):
             setattr(self, "__data__", dict(
                 A_logs=self.A_logs, Bs=Bs, Cs=Cs, Ds=self.Ds,
-                us=xs, dts=dts, delta_bias=self.dt_projs_bias, 
+                us=xs, dts=dts, delta_bias=self.dt_projs_bias,
                 initial_state=self.initial_state, final_satte=final_state,
                 ys=ys, y=y, H=H, W=W,
             ))
@@ -1104,7 +1109,106 @@ class SS2Dm0:
         return out
 
 
-class SS2D(nn.Module, SS2Dv0, SS2Dv2, SS2Dv3, SS2Dm0):
+# mamba3 (official ``mamba_ssm.modules.mamba3.Mamba3`` only; no mamba2 SSD / selective_scan_chunk_fn) ===
+class SS2Dm3:
+    """Same stem as SS2Dm0 (in_proj, optional z, dwconv, act); core is upstream ``Mamba3`` on the H*W sequence."""
+
+    def __initm3__(
+        self,
+        d_model=96,
+        d_state=64,
+        ssm_ratio=2.0,
+        dt_rank="auto",
+        act_layer=nn.GELU,
+        d_conv=3,
+        conv_bias=True,
+        dropout=0.0,
+        bias=False,
+        dt_min=0.001,
+        dt_max=0.1,
+        dt_init="random",
+        dt_scale=1.0,
+        dt_init_floor=1e-4,
+        initialize="v2",
+        forward_type="m3",
+        channel_first=False,
+        with_initial_state=False,
+        **kwargs,
+    ):
+        kwargs.pop("with_initial_state", None)
+        m3_expand = int(kwargs.pop("m3_expand", 2))
+        m3_headdim = int(kwargs.pop("m3_headdim", 64))
+        m3_mimo = bool(kwargs.pop("m3_mimo", True))
+        m3_mimo_rank = int(kwargs.pop("m3_mimo_rank", 4))
+        m3_chunk_size = kwargs.pop("m3_chunk_size", None)
+        m3_rope_fraction = float(kwargs.pop("m3_rope_fraction", 0.5))
+        m3_A_floor = float(kwargs.pop("m3_A_floor", 1e-4))
+
+        if Mamba3Module is None:
+            raise RuntimeError(
+                "SS2Dm3 needs `from mamba_ssm.modules.mamba3 import Mamba3` (install mamba_ssm with Mamba-3 / TileLang)."
+            )
+        if with_initial_state:
+            raise ValueError("SS2Dm3 does not support with_initial_state=True")
+
+        factory_kwargs = {"device": None, "dtype": None}
+        super().__init__()
+        self.channel_first = channel_first
+        Linear = nn.Linear
+        self.forward = self.forwardm3
+
+        ck = m3_chunk_size
+        if ck is None:
+            ck = max(8, 64 // max(m3_mimo_rank, 1)) if m3_mimo else 64
+
+        self.mamba_core = Mamba3Module(
+            d_model=d_model,
+            d_state=d_state,
+            expand=m3_expand,
+            headdim=m3_headdim,
+            ngroups=1,
+            rope_fraction=m3_rope_fraction,
+            dt_min=dt_min,
+            dt_max=dt_max,
+            dt_init_floor=dt_init_floor,
+            A_floor=m3_A_floor,
+            is_outproj_norm=False,
+            is_mimo=m3_mimo,
+            mimo_rank=m3_mimo_rank,
+            chunk_size=ck,
+            **factory_kwargs,
+        )
+
+    def forwardm3(self, x: torch.Tensor, **kwargs):
+        if self.channel_first:
+            x = x.permute(0, 2, 3, 1)
+        b, h, w, c = x.shape
+        l = h * w
+        x_hwwh = torch.stack(
+            [
+                x.reshape(b, l, c),
+                torch.transpose(x, dim0=1, dim1=2).contiguous().reshape(b, l, c),
+            ],
+            dim=1,
+        ).reshape(b, 2, l, c)
+        xs = torch.cat([x_hwwh, torch.flip(x_hwwh, dims=[2])], dim=1)  # (b, 4, l, c)
+
+        y_seq = self.mamba_core(xs.reshape(b * 4, l, c)).reshape(b, 4, l, c)
+        y_inv = torch.flip(y_seq[:, 2:4], dims=[2]).reshape(b, 2, l, c)
+        y_wh = torch.transpose(
+            y_seq[:, 1].reshape(b, w, h, c), dim0=1, dim1=2
+        ).contiguous().reshape(b, l, c)
+        y_invwh = torch.transpose(
+            y_inv[:, 1].reshape(b, w, h, c), dim0=1, dim1=2
+        ).contiguous().reshape(b, l, c)
+        y = (y_seq[:, 0] + y_inv[:, 0] + y_wh + y_invwh).reshape(b, h, w, c)
+        if self.channel_first:
+            y = y.permute(0, 3, 1, 2)
+            
+        return y
+
+
+class SS2D(nn.Module, SS2Dv0, SS2Dv2, SS2Dv3, SS2Dm0, SS2Dm3):
     def __init__(
         self,
         # basic dims ===========
@@ -1133,6 +1237,7 @@ class SS2D(nn.Module, SS2Dv0, SS2Dv2, SS2Dv3, SS2Dm0):
         **kwargs,
     ):
         nn.Module.__init__(self)
+        m3_kw = {k: kwargs.pop(k) for k in list(kwargs.keys()) if k.startswith("m3_")}
         kwargs.update(
             d_model=d_model, d_state=d_state, ssm_ratio=ssm_ratio, dt_rank=dt_rank,
             act_layer=act_layer, d_conv=d_conv, conv_bias=conv_bias, dropout=dropout, bias=bias,
@@ -1143,6 +1248,9 @@ class SS2D(nn.Module, SS2Dv0, SS2Dv2, SS2Dv3, SS2Dm0):
             self.__initv0__(seq=("seq" in forward_type), **kwargs)
         elif forward_type.startswith("xv"):
             self.__initxv__(**kwargs)
+        elif forward_type.startswith("m3"):
+            kwargs.update(m3_kw)
+            self.__initm3__(**kwargs)
         elif forward_type.startswith("m"):
             self.__initm0__(**kwargs)
         else:
@@ -1187,6 +1295,7 @@ class VSSBlock(nn.Module):
 
         if self.ssm_branch:
             self.norm = norm_layer(hidden_dim)
+            m3_kw = {k: v for k, v in kwargs.items() if k.startswith("m3_")}
             self.op = _SS2D(
                 d_model=hidden_dim, 
                 d_state=ssm_d_state, 
@@ -1209,6 +1318,7 @@ class VSSBlock(nn.Module):
                 # ==========================
                 forward_type=forward_type,
                 channel_first=channel_first,
+                **m3_kw,
             )
         
         self.drop_path = DropPath(drop_path)
@@ -1259,6 +1369,14 @@ class VSSM(nn.Module):
         ssm_init="v0",
         forward_type="v2",
         # =========================
+        m3_expand=2,
+        m3_headdim=64,
+        m3_mimo=True,
+        m3_mimo_rank=4,
+        m3_chunk_size=None,
+        m3_rope_fraction=0.5,
+        m3_A_floor=1e-4,
+        # =========================
         mlp_ratio=4.0,
         mlp_act_layer="gelu",
         mlp_drop_rate=0.0,
@@ -1278,6 +1396,15 @@ class VSSM(nn.Module):
         **kwargs,
     ):
         super().__init__()
+        m3_pass = dict(
+            m3_expand=m3_expand,
+            m3_headdim=m3_headdim,
+            m3_mimo=m3_mimo,
+            m3_mimo_rank=m3_mimo_rank,
+            m3_chunk_size=m3_chunk_size,
+            m3_rope_fraction=m3_rope_fraction,
+            m3_A_floor=m3_A_floor,
+        )
         self.channel_first = (norm_layer.lower() in ["bn", "ln2d"])
         self.num_classes = num_classes
         self.num_layers = len(depths)
@@ -1352,6 +1479,7 @@ class VSSM(nn.Module):
                 gmlp=gmlp,
                 # =================
                 _SS2D=_SS2D,
+                **m3_pass,
             ))
 
         self.classifier = nn.Sequential(OrderedDict(
@@ -1487,6 +1615,7 @@ class VSSM(nn.Module):
                 gmlp=gmlp,
                 use_checkpoint=use_checkpoint,
                 _SS2D=_SS2D,
+                **kwargs,
             ))
         
         return nn.Sequential(OrderedDict(

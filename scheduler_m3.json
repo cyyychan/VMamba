@@ -1,0 +1,9 @@
+{
+    "Name": "vmamba-m3-conv",
+    "Image": "harbor.smoa.cc/sychen/mamba3:v1.0",
+    "Command": "cd /dataset/siyuanchen/research/mamba/VMamba; python -m torch.distributed.launch --nnodes=1 --node_rank=0 --nproc_per_node=8 --master_addr='127.0.0.1' --master_port=29501 classification/main.py --cfg ./classification/configs/vssm/vmambav2m3_tiny_224.yaml --batch-size 128 --data-path /dataset/sharedir/research/ImageNet --output ./output",
+    "GPU": 8,
+    "GPUType": "L20",
+    "Node": "",
+    "Excludes": []
+}

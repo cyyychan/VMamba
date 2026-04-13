@@ -36,10 +36,9 @@ except:
     from mamba2.ssd_minimal import selective_scan_chunk_fn
 
 try:
-    from mamba_ssm.modules.mamba3 import Mamba3 as Mamba3Module
-except ImportError:
-    Mamba3Module = None
-
+    from .mamba3_siso import Mamba3SISO as Mamba3Module
+except:
+    from mamba3_siso import Mamba3SISO as Mamba3Module
 
 # =====================================================
 # we have this class as linear and conv init differ from each other
@@ -1107,12 +1106,9 @@ class SS2Dm0:
             y = y * z
         out = self.dropout(self.out_proj(y))
         return out
-
-
-# mamba3 (official ``mamba_ssm.modules.mamba3.Mamba3`` only; no mamba2 SSD / selective_scan_chunk_fn) ===
+    
+    
 class SS2Dm3:
-    """Same stem as SS2Dm0 (in_proj, optional z, dwconv, act); core is upstream ``Mamba3`` on the H*W sequence."""
-
     def __initm3__(
         self,
         d_model=96,
@@ -1136,35 +1132,47 @@ class SS2Dm3:
         **kwargs,
     ):
         kwargs.pop("with_initial_state", None)
-        m3_expand = int(kwargs.pop("m3_expand", 2))
-        m3_headdim = int(kwargs.pop("m3_headdim", 64))
-        m3_mimo = bool(kwargs.pop("m3_mimo", True))
-        m3_mimo_rank = int(kwargs.pop("m3_mimo_rank", 4))
-        m3_chunk_size = kwargs.pop("m3_chunk_size", None)
+        m3_headdim = int(kwargs.pop("m3_headdim", 16))
+        m3_chunk_size = kwargs.pop("m3_chunk_size", 64)
         m3_rope_fraction = float(kwargs.pop("m3_rope_fraction", 0.5))
         m3_A_floor = float(kwargs.pop("m3_A_floor", 1e-4))
-
-        if Mamba3Module is None:
-            raise RuntimeError(
-                "SS2Dm3 needs `from mamba_ssm.modules.mamba3 import Mamba3` (install mamba_ssm with Mamba-3 / TileLang)."
-            )
-        if with_initial_state:
-            raise ValueError("SS2Dm3 does not support with_initial_state=True")
-
         factory_kwargs = {"device": None, "dtype": None}
         super().__init__()
+        
+        d_inner = int(ssm_ratio * d_model)
+        # dwconv =======================================
+        self.with_dconv = d_conv > 1
+        if self.with_dconv:
+            self.conv2d = nn.Sequential(
+                Permute(0, 3, 1, 2),
+                nn.Conv2d(
+                    in_channels=d_inner,
+                    out_channels=d_inner,
+                    groups=d_inner,
+                    bias=conv_bias,
+                    kernel_size=d_conv,
+                    padding=(d_conv - 1) // 2,
+                    **factory_kwargs,
+                ),
+                Permute(0, 2, 3, 1),
+            ) 
+        
+        # in proj =======================================
+        self.in_proj = nn.Linear(d_model, d_inner, bias=bias)
+        self.act: nn.Module = act_layer()
+        
+        # out proj =======================================
+        self.out_act = nn.GELU()
+        self.out_proj = nn.Linear(d_inner, d_model, bias=bias)
+        self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
+
         self.channel_first = channel_first
-        Linear = nn.Linear
         self.forward = self.forwardm3
-
-        ck = m3_chunk_size
-        if ck is None:
-            ck = max(8, 64 // max(m3_mimo_rank, 1)) if m3_mimo else 64
-
+        # forward_core feeds (B*4, L, d_inner); Mamba3 in_proj last dim must be d_inner (not backbone d_model).
         self.mamba_core = Mamba3Module(
-            d_model=d_model,
+            d_model=d_inner,
             d_state=d_state,
-            expand=m3_expand,
+            expand=1,
             headdim=m3_headdim,
             ngroups=1,
             rope_fraction=m3_rope_fraction,
@@ -1172,40 +1180,168 @@ class SS2Dm3:
             dt_max=dt_max,
             dt_init_floor=dt_init_floor,
             A_floor=m3_A_floor,
-            is_outproj_norm=False,
-            is_mimo=m3_mimo,
-            mimo_rank=m3_mimo_rank,
-            chunk_size=ck,
+            chunk_size=m3_chunk_size,
             **factory_kwargs,
         )
 
-    def forwardm3(self, x: torch.Tensor, **kwargs):
-        if self.channel_first:
-            x = x.permute(0, 2, 3, 1)
+    def forward_core(self, x: torch.Tensor, scan_mode="cross2d", scan_force_torch=False, **kwargs):
+        assert scan_mode in ["unidi", "bidi", "cross2d"]
+        # x: always (B, H, W, C) NHWC; caller normalizes layout (see forwardm3).
         b, h, w, c = x.shape
         l = h * w
-        x_hwwh = torch.stack(
-            [
-                x.reshape(b, l, c),
-                torch.transpose(x, dim0=1, dim1=2).contiguous().reshape(b, l, c),
-            ],
-            dim=1,
-        ).reshape(b, 2, l, c)
-        xs = torch.cat([x_hwwh, torch.flip(x_hwwh, dims=[2])], dim=1)  # (b, 4, l, c)
+        _scan_mode = dict(cross2d=0, unidi=1, bidi=2, cascade2d=3)[scan_mode]
 
+        # cross_scan_fn(..., in_channel_first=False, out_channel_first=False):
+        #   (B, H, W, C) -> (B, L, 4, C),  L=H*W; 4 directions same as forward_corem0 + csm_triton.cross_scan_fwd
+        xs = cross_scan_fn(
+            x.contiguous(),
+            in_channel_first=False,
+            out_channel_first=False,
+            scans=_scan_mode,
+            force_torch=scan_force_torch,
+        )
+        # (B, L, 4, C) -> (B, 4, L, C) so Mamba3 sees batch*4 independent length-L sequences per channel
+        xs = xs.permute(0, 2, 1, 3).contiguous()
+
+        # (B, 4, L, C) -> (B*4, L, C) -> mamba_core -> (B*4, L, C) -> (B, 4, L, C)
         y_seq = self.mamba_core(xs.reshape(b * 4, l, c)).reshape(b, 4, l, c)
-        y_inv = torch.flip(y_seq[:, 2:4], dims=[2]).reshape(b, 2, l, c)
-        y_wh = torch.transpose(
-            y_seq[:, 1].reshape(b, w, h, c), dim0=1, dim1=2
-        ).contiguous().reshape(b, l, c)
-        y_invwh = torch.transpose(
-            y_inv[:, 1].reshape(b, w, h, c), dim0=1, dim1=2
-        ).contiguous().reshape(b, l, c)
-        y = (y_seq[:, 0] + y_inv[:, 0] + y_wh + y_invwh).reshape(b, h, w, c)
+        # cross_merge_fn expects (B, H, W, K, C) with K=4 when out_channel_first=False (same layout as forward_corem0 ys.view)
+        #   (B, H, W, 4, C) -> (B, L, C)  (fused inverse of the 4 scans)
+        y = cross_merge_fn(
+            y_seq.view(b, h, w, 4, c),
+            in_channel_first=False,
+            out_channel_first=False,
+            scans=_scan_mode,
+            force_torch=scan_force_torch,
+        )
+        y = y.reshape(b, h, w, c)
+        return y.to(x.dtype)
+
+    def forwardm3(self, x: torch.Tensor, **kwargs):
+        # Normalize to NHWC once: Linear / conv2d(Permute…) / cross_scan all use last dim = C.
         if self.channel_first:
-            y = y.permute(0, 3, 1, 2)
+            x = x.permute(0, 2, 3, 1).contiguous()
+        x = self.in_proj(x)
+        if self.with_dconv:
+            x = self.conv2d(x)
+        x = self.act(x)
+        y = self.forward_core(x)
+        y = self.out_act(y)
+        out = self.dropout(self.out_proj(y))
+        if self.channel_first:
+            out = out.permute(0, 3, 1, 2).contiguous()
+        return out
+    
+
+# # mamba3 (official ``mamba_ssm.modules.mamba3.Mamba3`` only; no mamba2 SSD / selective_scan_chunk_fn) ===
+# class SS2Dm3:
+#     """Same stem as SS2Dm0 (in_proj, optional z, dwconv, act); core is upstream ``Mamba3`` on the H*W sequence."""
+
+#     def __initm3__(
+#         self,
+#         d_model=96,
+#         d_state=64,
+#         ssm_ratio=2.0,
+#         dt_rank="auto",
+#         act_layer=nn.GELU,
+#         d_conv=3,
+#         conv_bias=True,
+#         dropout=0.0,
+#         bias=False,
+#         dt_min=0.001,
+#         dt_max=0.1,
+#         dt_init="random",
+#         dt_scale=1.0,
+#         dt_init_floor=1e-4,
+#         initialize="v2",
+#         forward_type="m3",
+#         channel_first=False,
+#         with_initial_state=False,
+#         **kwargs,
+#     ):
+#         kwargs.pop("with_initial_state", None)
+#         m3_expand = int(kwargs.pop("m3_expand", 2))
+#         m3_headdim = int(kwargs.pop("m3_headdim", 64))
+#         m3_mimo = bool(kwargs.pop("m3_mimo", True))
+#         m3_mimo_rank = int(kwargs.pop("m3_mimo_rank", 4))
+#         m3_chunk_size = kwargs.pop("m3_chunk_size", None)
+#         m3_rope_fraction = float(kwargs.pop("m3_rope_fraction", 0.5))
+#         m3_A_floor = float(kwargs.pop("m3_A_floor", 1e-4))
+
+#         if m3_mimo and d_state % 16 != 0:
+#             raise ValueError(
+#                 f"Mamba-3 with M3_MIMO=True uses TileLang GEMM that requires "
+#                 f"SSM_D_STATE divisible by 16; got d_state={d_state}. "
+#                 f"Set MODEL.VSSM.M3_MIMO to false for SISO, or set SSM_D_STATE to 16, 32, ..."
+#             )
+#         if not m3_mimo and d_state < 16:
+#             raise ValueError(
+#                 f"Mamba-3 SISO (mamba_ssm mamba3_siso Triton) requires tl.dot K>=16; "
+#                 f"set MODEL.VSSM.SSM_D_STATE >= 16 (got d_state={d_state})."
+#             )
+
+#         if Mamba3Module is None:
+#             raise RuntimeError(
+#                 "SS2Dm3 needs `from mamba_ssm.modules.mamba3 import Mamba3` (install mamba_ssm with Mamba-3 / TileLang)."
+#             )
+#         if with_initial_state:
+#             raise ValueError("SS2Dm3 does not support with_initial_state=True")
+
+#         factory_kwargs = {"device": None, "dtype": None}
+#         super().__init__()
+#         self.channel_first = channel_first
+#         Linear = nn.Linear
+#         self.forward = self.forwardm3
+
+#         ck = m3_chunk_size
+#         if ck is None:
+#             ck = max(8, 64 // max(m3_mimo_rank, 1)) if m3_mimo else 64
+
+#         self.mamba_core = Mamba3Module(
+#             d_model=d_model,
+#             d_state=d_state,
+#             expand=m3_expand,
+#             headdim=m3_headdim,
+#             ngroups=1,
+#             rope_fraction=m3_rope_fraction,
+#             dt_min=dt_min,
+#             dt_max=dt_max,
+#             dt_init_floor=dt_init_floor,
+#             A_floor=m3_A_floor,
+#             is_outproj_norm=False,
+#             is_mimo=m3_mimo,
+#             mimo_rank=m3_mimo_rank,
+#             chunk_size=ck,
+#             **factory_kwargs,
+#         )
+
+#     def forwardm3(self, x: torch.Tensor, **kwargs):
+#         if self.channel_first:
+#             x = x.permute(0, 2, 3, 1)
+#         b, h, w, c = x.shape
+#         l = h * w
+#         x_hwwh = torch.stack(
+#             [
+#                 x.reshape(b, l, c),
+#                 torch.transpose(x, dim0=1, dim1=2).contiguous().reshape(b, l, c),
+#             ],
+#             dim=1,
+#         ).reshape(b, 2, l, c)
+#         xs = torch.cat([x_hwwh, torch.flip(x_hwwh, dims=[2])], dim=1)  # (b, 4, l, c)
+
+#         y_seq = self.mamba_core(xs.reshape(b * 4, l, c)).reshape(b, 4, l, c)
+#         y_inv = torch.flip(y_seq[:, 2:4], dims=[2]).reshape(b, 2, l, c)
+#         y_wh = torch.transpose(
+#             y_seq[:, 1].reshape(b, w, h, c), dim0=1, dim1=2
+#         ).contiguous().reshape(b, l, c)
+#         y_invwh = torch.transpose(
+#             y_inv[:, 1].reshape(b, w, h, c), dim0=1, dim1=2
+#         ).contiguous().reshape(b, l, c)
+#         y = (y_seq[:, 0] + y_inv[:, 0] + y_wh + y_invwh).reshape(b, h, w, c)
+#         if self.channel_first:
+#             y = y.permute(0, 3, 1, 2)
             
-        return y
+#         return y
 
 
 class SS2D(nn.Module, SS2Dv0, SS2Dv2, SS2Dv3, SS2Dm0, SS2Dm3):

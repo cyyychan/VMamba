@@ -8,6 +8,7 @@
 # --------------------------------------------------------
 
 import os
+import sys
 import time
 import json
 import random
@@ -19,6 +20,10 @@ import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
+
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _THIS_DIR not in sys.path:
+    sys.path.insert(0, _THIS_DIR)
 
 from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 from timm.utils import accuracy, AverageMeter
@@ -114,10 +119,26 @@ def main(config, args):
             logger.info(str(model))
             n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
             logger.info(f"number of params: {n_parameters}")
-            flops = model.flops()
-            logger.info(f"number of GFLOPs: {flops / 1e9}")
+            try:
+                flops = model.flops()
+                logger.info(f"number of GFLOPs: {flops / 1e9}")
+            except Exception as exc:
+                logger.warning(
+                    "FLOPs estimation via model.flops() failed (%s: %s). "
+                    "Common with Mamba-3 + Triton RMSNorm under fvcore JIT trace; "
+                    "training is unchanged.",
+                    type(exc).__name__,
+                    exc,
+                )
         else:
-            logger.info(flop_count_str(FlopCountAnalysis(model, (dataset_val[0][0][None],))))
+            try:
+                logger.info(flop_count_str(FlopCountAnalysis(model, (dataset_val[0][0][None],))))
+            except Exception as exc:
+                logger.warning(
+                    "FlopCountAnalysis failed (%s: %s); skipping.",
+                    type(exc).__name__,
+                    exc,
+                )
     torch.cuda.empty_cache()
     dist.barrier()
     model.cuda()

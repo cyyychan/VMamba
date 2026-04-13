@@ -37,6 +37,11 @@ def build_vssm_model(config, **kwargs):
             patchembed_version=config.MODEL.VSSM.PATCHEMBED,
             gmlp=config.MODEL.VSSM.GMLP,
             use_checkpoint=config.TRAIN.USE_CHECKPOINT,
+            # =================== Mamba-3 (SS2Dm3); must match YAML or defaults override config
+            m3_headdim=config.MODEL.VSSM.M3_HEADDIM,
+            m3_chunk_size=config.MODEL.VSSM.M3_CHUNK_SIZE,
+            m3_rope_fraction=config.MODEL.VSSM.M3_ROPE_FRACTION,
+            m3_A_floor=config.MODEL.VSSM.M3_A_FLOOR,
             # ===================
             posembed=config.MODEL.VSSM.POSEMBED,
             imgsize=config.DATA.IMG_SIZE,

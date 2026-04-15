@@ -218,6 +218,13 @@ def main(config, args):
             throughput(data_loader_val, model_ema.ema, logger)
         return
 
+    if config.EVAL_MODE:
+        if not config.MODEL.RESUME and not config.MODEL.PRETRAINED:
+            logger.warning(
+                "EVAL_MODE: no weights loaded (--resume or pretrained); skipping training "
+                "and validation was not run."
+            )
+        return
 
     logger.info("Start training")
     start_time = time.time()

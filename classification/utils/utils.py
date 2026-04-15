@@ -14,13 +14,21 @@ import torch.distributed as dist
 from timm.utils import ModelEma as ModelEma
 
 
+def _torch_load_checkpoint(path, map_location="cpu"):
+    """PyTorch 2.6+ defaults torch.load(..., weights_only=True); VMamba ckpts may contain CfgNode etc."""
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
 def load_checkpoint_ema(config, model, optimizer, lr_scheduler, loss_scaler, logger, model_ema: ModelEma=None):
     logger.info(f"==============> Resuming form {config.MODEL.RESUME}....................")
     if config.MODEL.RESUME.startswith('https'):
         checkpoint = torch.hub.load_state_dict_from_url(
             config.MODEL.RESUME, map_location='cpu', check_hash=True)
     else:
-        checkpoint = torch.load(config.MODEL.RESUME, map_location='cpu')
+        checkpoint = _torch_load_checkpoint(config.MODEL.RESUME, map_location='cpu')
     
     if 'model' in checkpoint:
         msg = model.load_state_dict(checkpoint['model'], strict=False)
@@ -58,7 +66,7 @@ def load_checkpoint_ema(config, model, optimizer, lr_scheduler, loss_scaler, log
 
 def load_pretrained_ema(config, model, logger, model_ema: ModelEma=None):
     logger.info(f"==============> Loading weight {config.MODEL.PRETRAINED} for fine-tuning......")
-    checkpoint = torch.load(config.MODEL.PRETRAINED, map_location='cpu')
+    checkpoint = _torch_load_checkpoint(config.MODEL.PRETRAINED, map_location='cpu')
     
     if 'model' in checkpoint:
         msg = model.load_state_dict(checkpoint['model'], strict=False)

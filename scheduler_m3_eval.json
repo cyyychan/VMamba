@@ -1,0 +1,9 @@
+{
+    "Name": "vmamba-m3-conv-eval",
+    "Image": "harbor.smoa.cc/sychen/mamba3:v1.0",
+    "Command": "cd /dataset/siyuanchen/research/mamba/VMamba; python -m torch.distributed.launch --nnodes=1 --node_rank=0 --nproc_per_node=1 --master_addr='127.0.0.1' --master_port=29501 classification/main.py --cfg ./classification/configs/vssm/vmambav2m3_tiny_224.yaml --batch-size 32 --data-path /dataset/sharedir/research/ImageNet --output ./output --resume /dataset/siyuanchen/research/mamba/VMamba/output/vssm1_tiny_m3_0230/20260411105724/ckpt_epoch_299.pth --eval",
+    "GPU": 1,
+    "GPUType": "4090D",
+    "Node": "",
+    "Excludes": []
+}

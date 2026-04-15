@@ -10,11 +10,11 @@ MODEL:
     DEPTHS: [ 2, 2, 5, 2 ]
     SSM_D_STATE: 16
     SSM_DT_RANK: "auto"
-    SSM_RATIO: 1.0
+    SSM_RATIO: 2.0
     SSM_CONV: 3
     SSM_CONV_BIAS: false
     SSM_INIT: "v2"
-    SSM_FORWARDTYPE: "m3_noz"
+    SSM_FORWARDTYPE: "m3"
     MLP_RATIO: 4.0
     DOWNSAMPLE: "v3"
     PATCHEMBED: "v2"

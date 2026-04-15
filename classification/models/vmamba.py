@@ -1208,7 +1208,7 @@ class SS2Dm3:
         # cross_merge_fn expects (B, H, W, K, C) with K=4 when out_channel_first=False (same layout as forward_corem0 ys.view)
         #   (B, H, W, 4, C) -> (B, L, C)  (fused inverse of the 4 scans)
         y = cross_merge_fn(
-            y_seq.view(b, h, w, 4, c),
+            y_seq.permute(0, 2, 1, 3).view(b, h, w, 4, c),
             in_channel_first=False,
             out_channel_first=False,
             scans=_scan_mode,
